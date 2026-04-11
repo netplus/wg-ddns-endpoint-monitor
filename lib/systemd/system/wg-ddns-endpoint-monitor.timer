@@ -1,0 +1,13 @@
+[Unit]
+Description=Periodically check DDNS-backed WireGuard peer endpoints
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=30s
+AccuracySec=1s
+RandomizedDelaySec=1s
+Unit=wg-ddns-endpoint-monitor.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target

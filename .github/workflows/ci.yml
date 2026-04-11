@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Shell Syntax
+        run: |
+          bash -n build-deb.sh
+          bash -n usr/libexec/wg-ddns-endpoint-monitor
+          sh -n DEBIAN/postinst
+          sh -n DEBIAN/prerm
+          sh -n DEBIAN/postrm
+          bash -n tests/product-smoke.sh
+
+      - name: Smoke Tests
+        run: |
+          bash tests/product-smoke.sh
+
+      - name: Build Debian Package
+        run: |
+          bash build-deb.sh /tmp/wg-ddns-endpoint-monitor.deb
+
+      - name: Inspect Debian Package
+        run: |
+          dpkg-deb -I /tmp/wg-ddns-endpoint-monitor.deb
+          dpkg-deb -c /tmp/wg-ddns-endpoint-monitor.deb

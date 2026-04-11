@@ -1,0 +1,13 @@
+Package: wg-ddns-endpoint-monitor
+Version: 1.1.0-1
+Section: net
+Priority: optional
+Architecture: all
+Depends: bash, wireguard-tools, systemd, libc-bin, util-linux
+Maintainer: netplus <netplusplus@outlook.com>
+Description: Monitor DDNS-backed WireGuard peer hostnames and refresh stale runtime endpoints
+ A timer-driven oneshot monitor that inspects WireGuard peer Endpoint hostnames,
+ checks handshake age, detects DNS/IP changes, and refreshes stale runtime endpoints with wg set.
+ .
+ It supports automatic discovery from /etc/wireguard/*.conf and optional explicit
+ endpoint mappings via /etc/wg-ddns-endpoint-monitor/endpoints.conf.

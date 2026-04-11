@@ -1,0 +1,10 @@
+[Unit]
+Description=Watch wg-ddns-endpoint-monitor configuration files for changes
+
+[Path]
+PathChanged=/etc/wg-ddns-endpoint-monitor/config
+PathChanged=/etc/wg-ddns-endpoint-monitor/endpoints.conf
+Unit=wg-ddns-endpoint-monitor.service
+
+[Install]
+WantedBy=multi-user.target

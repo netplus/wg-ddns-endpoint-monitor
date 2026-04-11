@@ -1,0 +1,32 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure|abort-upgrade|abort-remove|abort-deconfigure)
+        if command -v systemctl >/dev/null 2>&1; then
+            should_start=0
+            if [ ! -e /etc/wg-ddns-endpoint-monitor/config ] && [ -e /etc/default/wg-ddns-endpoint-monitor ]; then
+                mkdir -p /etc/wg-ddns-endpoint-monitor >/dev/null 2>&1 || true
+                cp -p /etc/default/wg-ddns-endpoint-monitor /etc/wg-ddns-endpoint-monitor/config >/dev/null 2>&1 || true
+            fi
+            systemctl daemon-reload >/dev/null 2>&1 || true
+            if [ "$1" = configure ] && [ -z "${2:-}" ]; then
+                systemctl enable wg-ddns-endpoint-monitor.timer >/dev/null 2>&1 || true
+                systemctl enable wg-ddns-endpoint-monitor.path >/dev/null 2>&1 || true
+                should_start=1
+            elif systemctl is-enabled --quiet wg-ddns-endpoint-monitor.timer >/dev/null 2>&1; then
+                systemctl enable wg-ddns-endpoint-monitor.path >/dev/null 2>&1 || true
+                should_start=1
+            fi
+            if [ "$should_start" -eq 1 ]; then
+                systemctl restart wg-ddns-endpoint-monitor.timer >/dev/null 2>&1 || \
+                    systemctl start wg-ddns-endpoint-monitor.timer >/dev/null 2>&1 || true
+                systemctl restart wg-ddns-endpoint-monitor.path >/dev/null 2>&1 || \
+                    systemctl start wg-ddns-endpoint-monitor.path >/dev/null 2>&1 || true
+                systemctl start wg-ddns-endpoint-monitor.service >/dev/null 2>&1 || true
+            fi
+        fi
+        ;;
+esac
+
+exit 0

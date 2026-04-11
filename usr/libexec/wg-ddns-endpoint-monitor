@@ -1,0 +1,849 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+shopt -s extglob
+
+PROG="wg-ddns-endpoint-monitor"
+DEFAULT_CONFIG_FILE="/etc/${PROG}/config"
+LEGACY_CONFIG_FILE="/etc/default/${PROG}"
+DEFAULT_ENDPOINTS_FILE="/etc/wg-ddns-endpoint-monitor/endpoints.conf"
+WG_CONF_DIR_DEFAULT="/etc/wireguard"
+STATE_VERSION="2"
+TIMER_UNIT_NAME="${PROG}.timer"
+LOCK_FILE="/run/lock/${PROG}.lock"
+
+log() {
+    local level="$1"; shift
+    local msg="$*"
+    logger -t "$PROG" -p "daemon.${level}" -- "$msg" 2>/dev/null || true
+    printf '[%(%F %T)T] [%s] %s\n' -1 "$level" "$msg"
+}
+
+trim() {
+    local s="$1"
+    s="${s#${s%%[![:space:]]*}}"
+    s="${s%${s##*[![:space:]]}}"
+    printf '%s' "$s"
+}
+
+max_int() {
+    local a="$1" b="$2"
+    if (( a >= b )); then
+        printf '%s' "$a"
+    else
+        printf '%s' "$b"
+    fi
+}
+
+min_int() {
+    local a="$1" b="$2"
+    if (( a <= b )); then
+        printf '%s' "$a"
+    else
+        printf '%s' "$b"
+    fi
+}
+
+timer_unit_value() {
+    local file="$1" key="$2"
+    [[ -r "$file" ]] || return 1
+    awk -F= -v key="$key" '
+        $1 == key {
+            value=substr($0, index($0, "=")+1)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+            if (value != "")
+                last=value
+        }
+        END {
+            if (last != "")
+                print last
+        }
+    ' "$file"
+}
+
+timespan_to_seconds() {
+    local raw="$1" number unit
+    raw="$(trim "$raw")"
+    [[ -n "$raw" ]] || return 1
+
+    if [[ "$raw" =~ ^[0-9]+$ ]]; then
+        printf '%s\n' "$raw"
+        return 0
+    fi
+
+    if [[ "$raw" =~ ^([0-9]+)(us|ms|s|min|m|h|d)$ ]]; then
+        number="${BASH_REMATCH[1]}"
+        unit="${BASH_REMATCH[2]}"
+        case "$unit" in
+            us|ms) printf '1\n' ;;
+            s) printf '%s\n' "$number" ;;
+            min|m) printf '%s\n' "$((number * 60))" ;;
+            h) printf '%s\n' "$((number * 3600))" ;;
+            d) printf '%s\n' "$((number * 86400))" ;;
+            *) return 1 ;;
+        esac
+        return 0
+    fi
+
+    return 1
+}
+
+detect_timer_interval_seconds() {
+    local value=""
+    local file
+
+    for file in \
+        "/usr/lib/systemd/system/${TIMER_UNIT_NAME}" \
+        "/lib/systemd/system/${TIMER_UNIT_NAME}" \
+        "/run/systemd/system/${TIMER_UNIT_NAME}" \
+        "/etc/systemd/system/${TIMER_UNIT_NAME}"
+    do
+        value="$(timer_unit_value "$file" "OnUnitActiveSec" 2>/dev/null || true)"
+        [[ -n "$value" ]] && TIMER_INTERVAL_RAW="$value"
+    done
+
+    while IFS= read -r file; do
+        value="$(timer_unit_value "$file" "OnUnitActiveSec" 2>/dev/null || true)"
+        [[ -n "$value" ]] && TIMER_INTERVAL_RAW="$value"
+    done < <(find "/run/systemd/system/${TIMER_UNIT_NAME}.d" -maxdepth 1 -type f -name '*.conf' 2>/dev/null | sort)
+
+    while IFS= read -r file; do
+        value="$(timer_unit_value "$file" "OnUnitActiveSec" 2>/dev/null || true)"
+        [[ -n "$value" ]] && TIMER_INTERVAL_RAW="$value"
+    done < <(find "/etc/systemd/system/${TIMER_UNIT_NAME}.d" -maxdepth 1 -type f -name '*.conf' 2>/dev/null | sort)
+
+    [[ -n "${TIMER_INTERVAL_RAW:-}" ]] || return 1
+    timespan_to_seconds "$TIMER_INTERVAL_RAW"
+}
+
+is_ipv4_literal() {
+    [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
+}
+
+is_ipv6_literal() {
+    local h="$1"
+    [[ "$h" == *:* && "$h" =~ ^[0-9A-Fa-f:]+$ ]]
+}
+
+is_ip_literal() {
+    is_ipv4_literal "$1" || is_ipv6_literal "$1"
+}
+
+parse_endpoint() {
+    local ep="$1"
+    local host port
+    if [[ "$ep" =~ ^\[([^][]+)\]:(.+)$ ]]; then
+        host="${BASH_REMATCH[1]}"
+        port="${BASH_REMATCH[2]}"
+    elif [[ "$ep" == *:* ]]; then
+        host="${ep%:*}"
+        port="${ep##*:}"
+    else
+        return 1
+    fi
+    [[ -n "$host" && -n "$port" ]] || return 1
+    printf '%s|%s\n' "$host" "$port"
+}
+
+format_endpoint_literal() {
+    local ip="$1" port="$2"
+    if is_ipv6_literal "$ip"; then
+        printf '[%s]:%s\n' "$ip" "$port"
+    else
+        printf '%s:%s\n' "$ip" "$port"
+    fi
+}
+
+resolve_host() {
+    local host="$1"
+    case "$PREFER_FAMILY" in
+        ipv4)
+            getent ahostsv4 "$host" 2>/dev/null | awk '{print $1}' | awk '!seen[$0]++' | sort -u
+            ;;
+        ipv6)
+            getent ahostsv6 "$host" 2>/dev/null | awk '{print $1}' | awk '!seen[$0]++' | sort -u
+            ;;
+        auto|*)
+            getent ahosts "$host" 2>/dev/null | awk '{print $1}' | awk '!seen[$0]++' | sort -u
+            ;;
+    esac
+}
+
+current_runtime_endpoint() {
+    local iface="$1" pubkey="$2"
+    wg show "$iface" endpoints 2>/dev/null | awk -v k="$pubkey" '$1 == k { print $2; exit }'
+}
+
+latest_handshake() {
+    local iface="$1" pubkey="$2"
+    wg show "$iface" latest-handshakes 2>/dev/null | awk -v k="$pubkey" '$1 == k { print $2; exit }'
+}
+
+peer_keepalive() {
+    local iface="$1" pubkey="$2"
+    wg show "$iface" persistent-keepalive 2>/dev/null | awk -v k="$pubkey" '$1 == k { print $2; exit }'
+}
+
+iface_active() {
+    wg show "$1" >/dev/null 2>&1
+}
+
+load_config() {
+    WG_INTERFACES="auto"
+    DISCOVERY_MODE="auto"
+    WG_CONF_DIR="$WG_CONF_DIR_DEFAULT"
+    PREFER_FAMILY="auto"
+    FAILOVER_HANDSHAKE_AGE=""
+    STALE_HANDSHAKE_THRESHOLD=""
+    BLOCKED_COOLDOWN=""
+    TIMER_INTERVAL=""
+    TIMER_INTERVAL_RAW=""
+    STATE_DIR="/run/${PROG}"
+
+    if [[ -r "$DEFAULT_CONFIG_FILE" ]]; then
+        # shellcheck disable=SC1090
+        source "$DEFAULT_CONFIG_FILE"
+    elif [[ -r "$LEGACY_CONFIG_FILE" ]]; then
+        # shellcheck disable=SC1090
+        source "$LEGACY_CONFIG_FILE"
+    fi
+
+    if [[ -z "${FAILOVER_HANDSHAKE_AGE:-}" ]]; then
+        FAILOVER_HANDSHAKE_AGE="${STALE_HANDSHAKE_THRESHOLD:-180}"
+    fi
+
+    local timer_interval_fallback="${TIMER_INTERVAL:-}"
+    TIMER_INTERVAL="$(detect_timer_interval_seconds 2>/dev/null || true)"
+    if [[ -z "$TIMER_INTERVAL" ]]; then
+        TIMER_INTERVAL="$timer_interval_fallback"
+    fi
+
+    [[ "$FAILOVER_HANDSHAKE_AGE" =~ ^[0-9]+$ ]] || FAILOVER_HANDSHAKE_AGE=180
+    (( FAILOVER_HANDSHAKE_AGE >= 0 )) || FAILOVER_HANDSHAKE_AGE=180
+    if [[ -z "${BLOCKED_COOLDOWN:-}" ]]; then
+        BLOCKED_COOLDOWN=$((FAILOVER_HANDSHAKE_AGE * 2))
+    fi
+    [[ "$BLOCKED_COOLDOWN" =~ ^[0-9]+$ ]] || BLOCKED_COOLDOWN=$((FAILOVER_HANDSHAKE_AGE * 2))
+    (( BLOCKED_COOLDOWN >= 0 )) || BLOCKED_COOLDOWN=$((FAILOVER_HANDSHAKE_AGE * 2))
+    [[ "$TIMER_INTERVAL" =~ ^[0-9]+$ ]] || TIMER_INTERVAL=30
+    (( TIMER_INTERVAL >= 1 )) || TIMER_INTERVAL=30
+    case "$DISCOVERY_MODE" in
+        auto|explicit|mixed) ;;
+        *) DISCOVERY_MODE="auto" ;;
+    esac
+    case "$PREFER_FAMILY" in
+        auto|ipv4|ipv6) ;;
+        *) PREFER_FAMILY="auto" ;;
+    esac
+
+    STATE_TTL="$(max_int 3600 "$((FAILOVER_HANDSHAKE_AGE + BLOCKED_COOLDOWN))")"
+}
+
+collect_auto_entries() {
+    local ifaces=() iface cfg
+    if [[ "$WG_INTERFACES" == "auto" ]]; then
+        while IFS= read -r -d '' cfg; do
+            iface="$(basename "$cfg" .conf)"
+            ifaces+=("$iface")
+        done < <(find "$WG_CONF_DIR" -maxdepth 1 -type f -name '*.conf' -print0 2>/dev/null | sort -z)
+    else
+        # shellcheck disable=SC2206
+        ifaces=( $WG_INTERFACES )
+    fi
+
+    for iface in "${ifaces[@]}"; do
+        cfg="$WG_CONF_DIR/$iface.conf"
+        [[ -r "$cfg" ]] || continue
+
+        awk -v iface="$iface" '
+            function trim(s) {
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", s)
+                return s
+            }
+            function emit() {
+                if (in_peer && pub != "" && ep != "")
+                    print iface "|" pub "|" ep
+            }
+            {
+                line=$0
+                sub(/[[:space:]]*#.*/, "", line)
+                line=trim(line)
+                if (line == "") next
+                if (line == "[Peer]") {
+                    emit()
+                    in_peer=1
+                    pub=""
+                    ep=""
+                    next
+                }
+                if (line ~ /^\[/) {
+                    emit()
+                    in_peer=0
+                    pub=""
+                    ep=""
+                    next
+                }
+                if (!in_peer) next
+                split(line, a, /=/)
+                key=trim(a[1])
+                val=trim(substr(line, index(line, "=")+1))
+                if (key == "PublicKey") pub=val
+                else if (key == "Endpoint") ep=val
+            }
+            END { emit() }
+        ' "$cfg"
+    done
+}
+
+collect_explicit_entries() {
+    local line iface pub endpoint
+    [[ -r "$DEFAULT_ENDPOINTS_FILE" ]] || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%%#*}"
+        line="$(trim "$line")"
+        [[ -n "$line" ]] || continue
+        IFS='|' read -r iface pub endpoint <<EOF_LINE
+$line
+EOF_LINE
+        iface="$(trim "$iface")"
+        pub="$(trim "$pub")"
+        endpoint="$(trim "$endpoint")"
+        [[ -n "$iface" && -n "$pub" && -n "$endpoint" ]] || continue
+        printf '%s|%s|%s\n' "$iface" "$pub" "$endpoint"
+    done < "$DEFAULT_ENDPOINTS_FILE"
+}
+
+collect_entries() {
+    declare -A seen=()
+    local entry iface pub endpoint parsed host
+
+    if [[ "$DISCOVERY_MODE" == "explicit" || "$DISCOVERY_MODE" == "mixed" ]]; then
+        while IFS= read -r entry; do
+            [[ -n "$entry" ]] || continue
+            IFS='|' read -r iface pub endpoint <<EOF_ENTRY1
+$entry
+EOF_ENTRY1
+            parsed="$(parse_endpoint "$endpoint" 2>/dev/null || true)"
+            [[ -n "$parsed" ]] || continue
+            host="${parsed%%|*}"
+            if is_ip_literal "$host"; then
+                continue
+            fi
+            if [[ -z "${seen[$iface|$pub]:-}" ]]; then
+                seen[$iface|$pub]="$endpoint"
+                printf '%s|%s|%s\n' "$iface" "$pub" "$endpoint"
+            fi
+        done < <(collect_explicit_entries)
+    fi
+
+    if [[ "$DISCOVERY_MODE" == "auto" || "$DISCOVERY_MODE" == "mixed" ]]; then
+        while IFS= read -r entry; do
+            [[ -n "$entry" ]] || continue
+            IFS='|' read -r iface pub endpoint <<EOF_ENTRY2
+$entry
+EOF_ENTRY2
+            parsed="$(parse_endpoint "$endpoint" 2>/dev/null || true)"
+            [[ -n "$parsed" ]] || continue
+            host="${parsed%%|*}"
+            if is_ip_literal "$host"; then
+                continue
+            fi
+            if [[ -z "${seen[$iface|$pub]:-}" ]]; then
+                seen[$iface|$pub]="$endpoint"
+                printf '%s|%s|%s\n' "$iface" "$pub" "$endpoint"
+            fi
+        done < <(collect_auto_entries)
+    fi
+}
+
+reset_state_vars() {
+    STATE_SELECTED_IP=""
+    STATE_LAST_SWITCH_TS=0
+    STATE_NO_HANDSHAKE_SINCE=0
+    STATE_VALID=0
+    unset STATE_BLOCKED_UNTIL_BY_IP
+    declare -gA STATE_BLOCKED_UNTIL_BY_IP=()
+}
+
+state_file_path() {
+    local iface="$1" pubkey="$2" safe_name
+    safe_name="$(printf '%s' "${iface}_${pubkey}" | tr -c 'A-Za-z0-9._-' '_')"
+    printf '%s/%s.state\n' "$STATE_DIR" "$safe_name"
+}
+
+drop_state_file() {
+    local path="$1"
+    [[ -n "$path" ]] || return 0
+    rm -f "$path" 2>/dev/null || true
+}
+
+invalidate_state_file() {
+    local path="$1"
+    drop_state_file "$path"
+    reset_state_vars
+}
+
+load_state() {
+    local iface="$1" pubkey="$2" fingerprint="$3"
+    local path key value version="" loaded_fingerprint="" mtime age_now
+    local blocked_entries="" parse_ok=1
+    declare -A seen_keys=()
+
+    reset_state_vars
+    path="$(state_file_path "$iface" "$pubkey")"
+    [[ -r "$path" ]] || return 1
+
+    mtime="$(stat -c '%Y' "$path" 2>/dev/null || printf '0')"
+    if ! [[ "$mtime" =~ ^[0-9]+$ ]]; then
+        invalidate_state_file "$path"
+        return 1
+    fi
+    age_now=$((EPOCHSECONDS - mtime))
+    if (( age_now > STATE_TTL )); then
+        invalidate_state_file "$path"
+        return 1
+    fi
+
+    while IFS='=' read -r key value || [[ -n "$key" ]]; do
+        if [[ -z "$key" || "$key" == "$value" ]]; then
+            parse_ok=0
+            break
+        fi
+        if [[ -n "${seen_keys[$key]:-}" ]]; then
+            parse_ok=0
+            break
+        fi
+        seen_keys["$key"]=1
+        case "$key" in
+            STATE_VERSION) version="$value" ;;
+            CONFIG_FINGERPRINT) loaded_fingerprint="$value" ;;
+            SELECTED_IP) STATE_SELECTED_IP="$value" ;;
+            LAST_SWITCH_TS) STATE_LAST_SWITCH_TS="$value" ;;
+            NO_HANDSHAKE_SINCE) STATE_NO_HANDSHAKE_SINCE="$value" ;;
+            BLOCKED_ENTRIES) blocked_entries="$value" ;;
+            *) parse_ok=0; break ;;
+        esac
+    done < "$path"
+
+    if (( ! parse_ok )) || \
+       [[ -z "${seen_keys[STATE_VERSION]:-}" ]] || \
+       [[ -z "${seen_keys[CONFIG_FINGERPRINT]:-}" ]] || \
+       [[ -z "${seen_keys[SELECTED_IP]:-}" ]] || \
+       [[ -z "${seen_keys[LAST_SWITCH_TS]:-}" ]] || \
+       [[ -z "${seen_keys[NO_HANDSHAKE_SINCE]:-}" ]] || \
+       [[ -z "${seen_keys[BLOCKED_ENTRIES]:-}" ]] || \
+       [[ "$version" != "$STATE_VERSION" ]] || \
+       [[ "$loaded_fingerprint" != "$fingerprint" ]]
+    then
+        invalidate_state_file "$path"
+        return 1
+    fi
+    if ! [[ "$STATE_LAST_SWITCH_TS" =~ ^[0-9]+$ ]] || ! [[ "$STATE_NO_HANDSHAKE_SINCE" =~ ^[0-9]+$ ]]; then
+        invalidate_state_file "$path"
+        return 1
+    fi
+    if [[ -n "$STATE_SELECTED_IP" ]] && ! is_ip_literal "$STATE_SELECTED_IP"; then
+        invalidate_state_file "$path"
+        return 1
+    fi
+
+    if ! load_blocked_entries_from_raw "$blocked_entries"; then
+        invalidate_state_file "$path"
+        return 1
+    fi
+
+    STATE_VALID=1
+    return 0
+}
+
+save_state() {
+    local iface="$1" pubkey="$2" fingerprint="$3" selected_ip="$4" last_switch_ts="$5" clear_blocked="$6" new_blocked_ip="$7" new_blocked_until="$8" no_handshake_since="${9:-$STATE_NO_HANDSHAKE_SINCE}"
+    local path tmp blocked_entries
+
+    if (( clear_blocked )); then
+        clear_blocked_state
+    fi
+    add_blocked_state_entry "$new_blocked_ip" "$new_blocked_until"
+    blocked_entries="$(serialize_blocked_entries)"
+    [[ "$no_handshake_since" =~ ^[0-9]+$ ]] || no_handshake_since=0
+
+    mkdir -p "$STATE_DIR"
+    path="$(state_file_path "$iface" "$pubkey")"
+
+    tmp="$(mktemp "$STATE_DIR/.state.XXXXXX")"
+    chmod 0600 "$tmp"
+    cat >"$tmp" <<EOF_STATE
+STATE_VERSION=$STATE_VERSION
+CONFIG_FINGERPRINT=$fingerprint
+SELECTED_IP=$selected_ip
+LAST_SWITCH_TS=$last_switch_ts
+NO_HANDSHAKE_SINCE=$no_handshake_since
+BLOCKED_ENTRIES=$blocked_entries
+EOF_STATE
+    mv -f "$tmp" "$path"
+
+    STATE_SELECTED_IP="$selected_ip"
+    STATE_LAST_SWITCH_TS="$last_switch_ts"
+    STATE_NO_HANDSHAKE_SINCE="$no_handshake_since"
+    STATE_VALID=1
+}
+
+runtime_ip_from_endpoint() {
+    local runtime_endpoint="$1" expected_port="$2" parsed runtime_host runtime_port
+
+    RUNTIME_VALID=0
+    RUNTIME_IP=""
+    parsed="$(parse_endpoint "$runtime_endpoint" 2>/dev/null || true)"
+    [[ -n "$parsed" ]] || return 1
+    runtime_host="${parsed%%|*}"
+    runtime_port="${parsed##*|}"
+    [[ "$runtime_port" == "$expected_port" ]] || return 1
+    is_ip_literal "$runtime_host" || return 1
+
+    RUNTIME_VALID=1
+    RUNTIME_IP="$runtime_host"
+    return 0
+}
+
+resolve_candidates() {
+    local host="$1" addr
+    CANDIDATE_IPS=()
+    while IFS= read -r addr; do
+        [[ -n "$addr" ]] || continue
+        is_ip_literal "$addr" || continue
+        CANDIDATE_IPS+=("$addr")
+    done < <(resolve_host "$host")
+}
+
+candidate_contains_ip() {
+    local needle="$1" addr
+    for addr in "${CANDIDATE_IPS[@]}"; do
+        [[ "$addr" == "$needle" ]] && return 0
+    done
+    return 1
+}
+
+is_blocked_ip_active() {
+    local ip="$1"
+    local blocked_until
+
+    blocked_until="$(blocked_until_for_ip "$ip")"
+    (( blocked_until > EPOCHSECONDS ))
+}
+
+select_candidate_ip() {
+    local excluded_ip="$1"
+    local addr blocked_until earliest_ip="" earliest_until=0
+
+    for addr in "${CANDIDATE_IPS[@]}"; do
+        [[ -n "$excluded_ip" && "$addr" == "$excluded_ip" ]] && continue
+        blocked_until="$(blocked_until_for_ip "$addr")"
+        if (( blocked_until <= EPOCHSECONDS )); then
+            printf '%s\n' "$addr"
+            return 0
+        fi
+        if [[ -z "$earliest_ip" || blocked_until < earliest_until ]]; then
+            earliest_ip="$addr"
+            earliest_until="$blocked_until"
+        fi
+    done
+    [[ -n "$earliest_ip" ]] && printf '%s\n' "$earliest_ip"
+    [[ -n "$earliest_ip" ]]
+}
+
+blocked_until_for_ip() {
+    local ip="$1" blocked_until
+
+    blocked_until="${STATE_BLOCKED_UNTIL_BY_IP[$ip]:-0}"
+    [[ "$blocked_until" =~ ^[0-9]+$ ]] || blocked_until=0
+    printf '%s\n' "$blocked_until"
+}
+
+clear_blocked_state() {
+    unset STATE_BLOCKED_UNTIL_BY_IP
+    declare -gA STATE_BLOCKED_UNTIL_BY_IP=()
+}
+
+prune_blocked_state() {
+    local ip blocked_until
+
+    for ip in "${!STATE_BLOCKED_UNTIL_BY_IP[@]}"; do
+        blocked_until="${STATE_BLOCKED_UNTIL_BY_IP[$ip]:-0}"
+        if ! [[ "$blocked_until" =~ ^[0-9]+$ ]] || (( blocked_until <= EPOCHSECONDS )); then
+            unset "STATE_BLOCKED_UNTIL_BY_IP[$ip]"
+        fi
+    done
+}
+
+add_blocked_state_entry() {
+    local ip="$1" blocked_until="$2"
+
+    [[ -n "$ip" ]] || return 0
+    is_ip_literal "$ip" || return 0
+    [[ "$blocked_until" =~ ^[0-9]+$ ]] || return 0
+    (( blocked_until > EPOCHSECONDS )) || return 0
+
+    STATE_BLOCKED_UNTIL_BY_IP["$ip"]="$blocked_until"
+}
+
+load_blocked_entries_from_raw() {
+    local raw="$1" entry ip blocked_until
+    local -a entries=()
+    declare -A seen_ips=()
+
+    clear_blocked_state
+    [[ -n "$raw" ]] || return 0
+    IFS=',' read -r -a entries <<< "$raw"
+    for entry in "${entries[@]}"; do
+        [[ -n "$entry" ]] || return 1
+        [[ "$entry" == *"@"* ]] || return 1
+        ip="${entry%@*}"
+        blocked_until="${entry##*@}"
+        is_ip_literal "$ip" || return 1
+        [[ "$blocked_until" =~ ^[0-9]+$ ]] || return 1
+        [[ -z "${seen_ips[$ip]:-}" ]] || return 1
+        seen_ips["$ip"]=1
+        STATE_BLOCKED_UNTIL_BY_IP["$ip"]="$blocked_until"
+    done
+    prune_blocked_state
+    return 0
+}
+
+serialize_blocked_entries() {
+    local ip blocked_until joined="" entry
+    local -a entries=()
+
+    prune_blocked_state
+    for ip in "${!STATE_BLOCKED_UNTIL_BY_IP[@]}"; do
+        blocked_until="${STATE_BLOCKED_UNTIL_BY_IP[$ip]}"
+        entries+=("$ip@$blocked_until")
+    done
+    (( ${#entries[@]} > 0 )) || return 0
+
+    IFS=$'\n' entries=($(printf '%s\n' "${entries[@]}" | sort))
+    for entry in "${entries[@]}"; do
+        if [[ -z "$joined" ]]; then
+            joined="$entry"
+        else
+            joined+=",${entry}"
+        fi
+    done
+    printf '%s\n' "$joined"
+    return 0
+}
+
+sync_runtime_state() {
+    local iface="$1" pubkey="$2" fingerprint="$3" runtime_ip="$4" last_switch_ts="$5" clear_blocked="$6" no_handshake_since="${7:-$STATE_NO_HANDSHAKE_SINCE}"
+
+    [[ -n "$runtime_ip" ]] || return 0
+    save_state "$iface" "$pubkey" "$fingerprint" "$runtime_ip" "$last_switch_ts" "$clear_blocked" "" 0 "$no_handshake_since"
+}
+
+mark_no_handshake_seen() {
+    local iface="$1" pubkey="$2" fingerprint="$3" runtime_ip="$4"
+    local selected_ip="$runtime_ip"
+
+    if (( STATE_NO_HANDSHAKE_SINCE > 0 )); then
+        return 0
+    fi
+    if [[ -z "$selected_ip" ]]; then
+        selected_ip="$STATE_SELECTED_IP"
+    fi
+    save_state "$iface" "$pubkey" "$fingerprint" "$selected_ip" "$STATE_LAST_SWITCH_TS" 0 "" 0 "$EPOCHSECONDS"
+}
+
+derive_post_switch_grace() {
+    local keepalive="$1"
+    local floor_by_timer floor_by_keepalive upper_bound derived
+
+    floor_by_timer=$((TIMER_INTERVAL * 2))
+    if (( keepalive > 0 )); then
+        floor_by_keepalive=$((keepalive * 2 + TIMER_INTERVAL))
+    else
+        floor_by_keepalive=45
+    fi
+    derived="$(max_int "$floor_by_timer" "$floor_by_keepalive")"
+    upper_bound=$((FAILOVER_HANDSHAKE_AGE / 2))
+    if (( upper_bound < TIMER_INTERVAL )); then
+        upper_bound="$TIMER_INTERVAL"
+    fi
+    min_int "$derived" "$upper_bound"
+}
+
+main() {
+    mkdir -p "$(dirname "$LOCK_FILE")"
+    exec 9>"$LOCK_FILE"
+    if ! flock -n 9; then
+        log info "another run is still active; skip"
+        exit 0
+    fi
+
+    load_config
+
+    local total=0 refreshed=0 skipped=0 errors=0
+    local entry iface pub endpoint parsed host port fingerprint
+    local hs age runtime_ep keepalive post_switch_grace new_runtime_ep target_ip no_handshake_age
+    local runtime_in_candidates blocked_ip blocked_until reason target_endpoint
+
+    while IFS= read -r entry; do
+        [[ -n "$entry" ]] || continue
+        total=$((total + 1))
+        IFS='|' read -r iface pub endpoint <<EOF_ENTRY
+$entry
+EOF_ENTRY
+
+        if ! iface_active "$iface"; then
+            log info "iface=$iface peer=${pub:0:12} skipped: interface not active"
+            skipped=$((skipped + 1))
+            continue
+        fi
+
+        parsed="$(parse_endpoint "$endpoint" 2>/dev/null || true)"
+        if [[ -z "$parsed" ]]; then
+            log warning "iface=$iface peer=${pub:0:12} skipped: invalid endpoint '$endpoint'"
+            skipped=$((skipped + 1))
+            continue
+        fi
+        host="${parsed%%|*}"
+        port="${parsed##*|}"
+        fingerprint="${iface}|${pub}|${host}|${port}|${PREFER_FAMILY}"
+
+        load_state "$iface" "$pub" "$fingerprint" || true
+
+        hs="$(latest_handshake "$iface" "$pub" || true)"
+        [[ "$hs" =~ ^[0-9]+$ ]] || hs=0
+        runtime_ep="$(current_runtime_endpoint "$iface" "$pub" || true)"
+        runtime_ip_from_endpoint "$runtime_ep" "$port" || true
+        keepalive="$(peer_keepalive "$iface" "$pub" || true)"
+        [[ "$keepalive" =~ ^[0-9]+$ ]] || keepalive=0
+        post_switch_grace="$(derive_post_switch_grace "$keepalive")"
+
+        if (( hs > 0 )); then
+            STATE_NO_HANDSHAKE_SINCE=0
+            age=$((EPOCHSECONDS - hs))
+            if (( age < FAILOVER_HANDSHAKE_AGE )); then
+                if (( RUNTIME_VALID )); then
+                    sync_runtime_state "$iface" "$pub" "$fingerprint" "$RUNTIME_IP" 0 1 0
+                fi
+                log info "iface=$iface peer=${pub:0:12} skipped: handshake_age=${age}s threshold=${FAILOVER_HANDSHAKE_AGE}s"
+                skipped=$((skipped + 1))
+                continue
+            fi
+        else
+            age=0
+            if (( STATE_NO_HANDSHAKE_SINCE <= 0 )); then
+                mark_no_handshake_seen "$iface" "$pub" "$fingerprint" "${RUNTIME_IP:-}"
+                log info "iface=$iface peer=${pub:0:12} skipped: first no-handshake observation recorded"
+                skipped=$((skipped + 1))
+                continue
+            fi
+            no_handshake_age=$((EPOCHSECONDS - STATE_NO_HANDSHAKE_SINCE))
+            if (( no_handshake_age < FAILOVER_HANDSHAKE_AGE )); then
+                if (( RUNTIME_VALID )); then
+                    sync_runtime_state "$iface" "$pub" "$fingerprint" "$RUNTIME_IP" "$STATE_LAST_SWITCH_TS" 0 "$STATE_NO_HANDSHAKE_SINCE"
+                fi
+                log info "iface=$iface peer=${pub:0:12} skipped: no_handshake_age=${no_handshake_age}s threshold=${FAILOVER_HANDSHAKE_AGE}s"
+                skipped=$((skipped + 1))
+                continue
+            fi
+            age="$no_handshake_age"
+        fi
+
+        resolve_candidates "$host"
+        if (( ${#CANDIDATE_IPS[@]} == 0 )); then
+            if (( hs == 0 )); then
+                log warning "iface=$iface peer=${pub:0:12} skipped: DNS returned no candidates for $host (no handshake yet)"
+            else
+                log warning "iface=$iface peer=${pub:0:12} skipped: DNS returned no candidates for $host, handshake_age=${age}s"
+            fi
+            skipped=$((skipped + 1))
+            continue
+        fi
+
+        runtime_in_candidates=0
+        if (( RUNTIME_VALID )) && candidate_contains_ip "$RUNTIME_IP"; then
+            runtime_in_candidates=1
+        fi
+
+        if (( STATE_LAST_SWITCH_TS > 0 )) && (( EPOCHSECONDS - STATE_LAST_SWITCH_TS < post_switch_grace )); then
+            if (( runtime_in_candidates )); then
+                sync_runtime_state "$iface" "$pub" "$fingerprint" "$RUNTIME_IP" "$STATE_LAST_SWITCH_TS" 0 "$STATE_NO_HANDSHAKE_SINCE"
+            fi
+            if (( hs == 0 )); then
+                log info "iface=$iface peer=${pub:0:12} skipped: within post-switch grace=${post_switch_grace}s no_handshake_age=${age}s"
+            else
+                log info "iface=$iface peer=${pub:0:12} skipped: within post-switch grace=${post_switch_grace}s handshake_age=${age}s"
+            fi
+            skipped=$((skipped + 1))
+            continue
+        fi
+
+        target_ip=""
+        reason=""
+        blocked_ip=""
+        blocked_until=0
+
+        if (( runtime_in_candidates )); then
+            if (( ${#CANDIDATE_IPS[@]} == 1 )); then
+                sync_runtime_state "$iface" "$pub" "$fingerprint" "$RUNTIME_IP" "$STATE_LAST_SWITCH_TS" 0 "$STATE_NO_HANDSHAKE_SINCE"
+                if (( hs == 0 )); then
+                    log info "iface=$iface peer=${pub:0:12} no change: single DNS candidate matches runtime, no_handshake_age=${age}s"
+                else
+                    log info "iface=$iface peer=${pub:0:12} no change: single DNS candidate matches runtime, handshake_age=${age}s"
+                fi
+                skipped=$((skipped + 1))
+                continue
+            fi
+            target_ip="$(select_candidate_ip "$RUNTIME_IP" || true)"
+            reason="failover_from_runtime"
+            blocked_ip="$RUNTIME_IP"
+            blocked_until=$((EPOCHSECONDS + BLOCKED_COOLDOWN))
+        elif [[ -n "$STATE_SELECTED_IP" ]] && candidate_contains_ip "$STATE_SELECTED_IP" && ! is_blocked_ip_active "$STATE_SELECTED_IP"; then
+            target_ip="$STATE_SELECTED_IP"
+            reason="restore_state"
+        else
+            target_ip="$(select_candidate_ip "" || true)"
+            reason="select_candidate"
+        fi
+
+        if [[ -z "$target_ip" ]]; then
+            if (( hs == 0 )); then
+                log info "iface=$iface peer=${pub:0:12} skipped: no eligible DNS candidate available (no handshake yet)"
+            else
+                log info "iface=$iface peer=${pub:0:12} skipped: no eligible DNS candidate available, handshake_age=${age}s"
+            fi
+            skipped=$((skipped + 1))
+            continue
+        fi
+
+        if (( RUNTIME_VALID )) && [[ "$target_ip" == "$RUNTIME_IP" ]]; then
+            sync_runtime_state "$iface" "$pub" "$fingerprint" "$RUNTIME_IP" "$STATE_LAST_SWITCH_TS" 0 "$STATE_NO_HANDSHAKE_SINCE"
+            if (( hs == 0 )); then
+                log info "iface=$iface peer=${pub:0:12} no change: runtime already on selected candidate, no_handshake_age=${age}s"
+            else
+                log info "iface=$iface peer=${pub:0:12} no change: runtime already on selected candidate, handshake_age=${age}s"
+            fi
+            skipped=$((skipped + 1))
+            continue
+        fi
+
+        target_endpoint="$(format_endpoint_literal "$target_ip" "$port")"
+        if wg set "$iface" peer "$pub" endpoint "$target_endpoint"; then
+            new_runtime_ep="$(current_runtime_endpoint "$iface" "$pub" || true)"
+            save_state "$iface" "$pub" "$fingerprint" "$target_ip" "$EPOCHSECONDS" 0 "$blocked_ip" "$blocked_until" "$STATE_NO_HANDSHAKE_SINCE"
+            if (( hs == 0 )); then
+                log info "iface=$iface peer=${pub:0:12} refreshed: runtime_before=${runtime_ep:-N/A} runtime_after=${new_runtime_ep:-N/A} target=${target_endpoint} no_handshake_age=${age}s reason=${reason}"
+            else
+                log info "iface=$iface peer=${pub:0:12} refreshed: runtime_before=${runtime_ep:-N/A} runtime_after=${new_runtime_ep:-N/A} target=${target_endpoint} handshake_age=${age}s reason=${reason}"
+            fi
+            refreshed=$((refreshed + 1))
+        else
+            log err "iface=$iface peer=${pub:0:12} refresh failed for target=$target_endpoint"
+            errors=$((errors + 1))
+        fi
+    done < <(collect_entries)
+
+    log info "summary: total=$total refreshed=$refreshed skipped=$skipped errors=$errors"
+    (( errors == 0 ))
+}
+
+main "$@"

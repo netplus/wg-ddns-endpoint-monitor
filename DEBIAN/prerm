@@ -1,0 +1,23 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    remove|deconfigure)
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl stop wg-ddns-endpoint-monitor.path >/dev/null 2>&1 || true
+            systemctl disable wg-ddns-endpoint-monitor.path >/dev/null 2>&1 || true
+            systemctl stop wg-ddns-endpoint-monitor.timer >/dev/null 2>&1 || true
+            systemctl disable wg-ddns-endpoint-monitor.timer >/dev/null 2>&1 || true
+            systemctl stop wg-ddns-endpoint-monitor.service >/dev/null 2>&1 || true
+        fi
+        ;;
+    upgrade|failed-upgrade)
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl stop wg-ddns-endpoint-monitor.path >/dev/null 2>&1 || true
+            systemctl stop wg-ddns-endpoint-monitor.timer >/dev/null 2>&1 || true
+            systemctl stop wg-ddns-endpoint-monitor.service >/dev/null 2>&1 || true
+        fi
+        ;;
+esac
+
+exit 0

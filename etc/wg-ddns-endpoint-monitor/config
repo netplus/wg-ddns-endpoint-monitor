@@ -1,0 +1,31 @@
+# /etc/wg-ddns-endpoint-monitor/config
+#
+# Monitored WireGuard interfaces:
+# - auto: scan /etc/wireguard/*.conf
+# - or a space-separated list, for example: "wg0 wg1"
+WG_INTERFACES="auto"
+
+# Discovery mode:
+# - auto:     discover [Peer] Endpoint hostnames from /etc/wireguard/<iface>.conf
+# - explicit: use only /etc/wg-ddns-endpoint-monitor/endpoints.conf
+# - mixed:    explicit entries override auto-discovered iface+peer pairs
+DISCOVERY_MODE="auto"
+
+# WireGuard config directory used by auto discovery
+WG_CONF_DIR="/etc/wireguard"
+
+# Preferred DNS family: auto / ipv4 / ipv6
+PREFER_FAMILY="auto"
+
+# Detection cadence is configured in:
+#   /etc/systemd/system/wg-ddns-endpoint-monitor.timer.d/override.conf
+
+# Only attempt endpoint failover when the latest successful handshake is older than
+# this threshold. Unit: seconds.
+FAILOVER_HANDSHAKE_AGE=180
+
+# Short blocked-IP cooldown is derived internally as 2 * FAILOVER_HANDSHAKE_AGE.
+
+# Peers that have never completed a handshake are observed locally first.
+# They only enter failover logic after remaining handshake-less for
+# FAILOVER_HANDSHAKE_AGE seconds.

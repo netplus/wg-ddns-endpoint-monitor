@@ -1,0 +1,3 @@
+/etc/wg-ddns-endpoint-monitor/config
+/etc/wg-ddns-endpoint-monitor/endpoints.conf
+/etc/systemd/system/wg-ddns-endpoint-monitor.timer.d/override.conf
