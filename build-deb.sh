@@ -36,7 +36,7 @@ ARCH="$(awk -F': *' '$1=="Architecture" {print $2; exit}' DEBIAN/control)"
 [[ -n "$VERSION" ]] || die "failed to parse Version from DEBIAN/control"
 [[ -n "$ARCH" ]] || die "failed to parse Architecture from DEBIAN/control"
 
-DEFAULT_OUT="$(cd .. && pwd)/${PACKAGE}_${VERSION}_${ARCH}.deb"
+DEFAULT_OUT="$ROOT_DIR/bin/${PACKAGE}_${VERSION}_${ARCH}.deb"
 OUT_PATH="${1:-$DEFAULT_OUT}"
 case "$OUT_PATH" in
     /*) ;;

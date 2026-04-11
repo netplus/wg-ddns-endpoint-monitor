@@ -323,6 +323,12 @@ Then build the Debian package:
 ./build-deb.sh
 ```
 
+By default, the package is written to the project-local `bin/` directory:
+
+```bash
+./bin/wg-ddns-endpoint-monitor_<version>_<arch>.deb
+```
+
 Or choose an explicit output path:
 
 ```bash
@@ -334,8 +340,8 @@ This produces a `.deb` containing the monitor script, systemd unit files, defaul
 Useful package inspection commands:
 
 ```bash
-dpkg-deb -c /tmp/wg-ddns-endpoint-monitor.deb
-dpkg-deb -I /tmp/wg-ddns-endpoint-monitor.deb
+dpkg-deb -c ./bin/wg-ddns-endpoint-monitor_<version>_<arch>.deb
+dpkg-deb -I ./bin/wg-ddns-endpoint-monitor_<version>_<arch>.deb
 ```
 
 ## Validation
