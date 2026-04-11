@@ -196,7 +196,6 @@ DNS
     local state
     state="$(state_path wg0 peerA)"
     cat >"$state" <<EOFSTATE
-STATE_VERSION=2
 CONFIG_FINGERPRINT=wg0|peerA|vpn.example.com|51820|auto
 SELECTED_IP=10.0.0.2
 LAST_SWITCH_TS=$((NOW - 10))
@@ -222,7 +221,6 @@ DNS
     local state
     state="$(state_path wg0 peerA)"
     cat >"$state" <<EOFSTATE
-STATE_VERSION=2
 CONFIG_FINGERPRINT=wg0|peerA|vpn.example.com|51820|auto
 SELECTED_IP=10.0.0.9
 LAST_SWITCH_TS=0
@@ -261,7 +259,6 @@ DNS
     local state
     state="$(state_path wg0 peerA)"
     cat >"$state" <<EOFSTATE
-STATE_VERSION=2
 CONFIG_FINGERPRINT=wg0|peerA|vpn.example.com|51820|auto
 SELECTED_IP=10.0.0.1
 LAST_SWITCH_TS=0
@@ -283,7 +280,6 @@ case_corrupted_state_is_dropped_and_rebuilt() {
     local state
     state="$(state_path wg0 peerA)"
     cat >"$state" <<'EOFSTATE'
-STATE_VERSION=2
 CONFIG_FINGERPRINT=wg0|peerA|vpn.example.com|51820|auto
 SELECTED_IP=10.0.0.1
 LAST_SWITCH_TS=oops
@@ -305,7 +301,6 @@ case_malformed_blocked_entries_are_dropped_and_rebuilt() {
     local state
     state="$(state_path wg0 peerA)"
     cat >"$state" <<'EOFSTATE'
-STATE_VERSION=2
 CONFIG_FINGERPRINT=wg0|peerA|vpn.example.com|51820|auto
 SELECTED_IP=10.0.0.1
 LAST_SWITCH_TS=0
@@ -317,6 +312,29 @@ EOFSTATE
 
     assert_contains "$state" 'SELECTED_IP=10.0.0.1'
     assert_contains "$state" 'BLOCKED_ENTRIES='
+}
+
+case_legacy_state_version_is_dropped_and_rebuilt() {
+    echo 'wg0|peerA|vpn.example.com:51820' > "$ENTRIES_FILE"
+    echo "wg0|peerA=$((NOW - 50))" > "$HS_FILE"
+    echo 'wg0|peerA=10.0.0.1:51820' > "$RUNTIME_FILE"
+
+    local state
+    state="$(state_path wg0 peerA)"
+    cat >"$state" <<'EOFSTATE'
+STATE_VERSION=2
+CONFIG_FINGERPRINT=wg0|peerA|vpn.example.com|51820|auto
+SELECTED_IP=10.0.0.1
+LAST_SWITCH_TS=0
+NO_HANDSHAKE_SINCE=0
+BLOCKED_ENTRIES=
+EOFSTATE
+
+    main
+
+    assert_contains "$state" 'SELECTED_IP=10.0.0.1'
+    ! grep -q '^STATE_VERSION=' "$state"
+    assert_contains "$state" 'LAST_SWITCH_TS=0'
 }
 
 case_prefer_family_ipv4_writes_literal_ipv4() {
@@ -462,6 +480,7 @@ run_case no_handshake_first_seen_records_only case_no_handshake_first_seen_recor
 run_case no_handshake_wait_then_failover case_no_handshake_wait_then_failover
 run_case corrupted_state_is_dropped_and_rebuilt case_corrupted_state_is_dropped_and_rebuilt
 run_case malformed_blocked_entries_are_dropped_and_rebuilt case_malformed_blocked_entries_are_dropped_and_rebuilt
+run_case legacy_state_version_is_dropped_and_rebuilt case_legacy_state_version_is_dropped_and_rebuilt
 run_case prefer_family_ipv4_writes_literal_ipv4 case_prefer_family_ipv4_writes_literal_ipv4
 run_case auto_mode_writes_literal_ip case_auto_mode_writes_literal_ip
 run_case mixed_mode_explicit_override_writes_literal_ip case_mixed_mode_explicit_override_writes_literal_ip

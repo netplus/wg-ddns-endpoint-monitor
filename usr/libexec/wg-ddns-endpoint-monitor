@@ -7,7 +7,6 @@ DEFAULT_CONFIG_FILE="/etc/${PROG}/config"
 LEGACY_CONFIG_FILE="/etc/default/${PROG}"
 DEFAULT_ENDPOINTS_FILE="/etc/wg-ddns-endpoint-monitor/endpoints.conf"
 WG_CONF_DIR_DEFAULT="/etc/wireguard"
-STATE_VERSION="2"
 TIMER_UNIT_NAME="${PROG}.timer"
 LOCK_FILE="/run/lock/${PROG}.lock"
 
@@ -384,7 +383,7 @@ invalidate_state_file() {
 
 load_state() {
     local iface="$1" pubkey="$2" fingerprint="$3"
-    local path key value version="" loaded_fingerprint="" mtime age_now
+    local path key value loaded_fingerprint="" mtime age_now
     local blocked_entries="" parse_ok=1
     declare -A seen_keys=()
 
@@ -414,7 +413,6 @@ load_state() {
         fi
         seen_keys["$key"]=1
         case "$key" in
-            STATE_VERSION) version="$value" ;;
             CONFIG_FINGERPRINT) loaded_fingerprint="$value" ;;
             SELECTED_IP) STATE_SELECTED_IP="$value" ;;
             LAST_SWITCH_TS) STATE_LAST_SWITCH_TS="$value" ;;
@@ -425,13 +423,11 @@ load_state() {
     done < "$path"
 
     if (( ! parse_ok )) || \
-       [[ -z "${seen_keys[STATE_VERSION]:-}" ]] || \
        [[ -z "${seen_keys[CONFIG_FINGERPRINT]:-}" ]] || \
        [[ -z "${seen_keys[SELECTED_IP]:-}" ]] || \
        [[ -z "${seen_keys[LAST_SWITCH_TS]:-}" ]] || \
        [[ -z "${seen_keys[NO_HANDSHAKE_SINCE]:-}" ]] || \
        [[ -z "${seen_keys[BLOCKED_ENTRIES]:-}" ]] || \
-       [[ "$version" != "$STATE_VERSION" ]] || \
        [[ "$loaded_fingerprint" != "$fingerprint" ]]
     then
         invalidate_state_file "$path"
@@ -472,7 +468,6 @@ save_state() {
     tmp="$(mktemp "$STATE_DIR/.state.XXXXXX")"
     chmod 0600 "$tmp"
     cat >"$tmp" <<EOF_STATE
-STATE_VERSION=$STATE_VERSION
 CONFIG_FINGERPRINT=$fingerprint
 SELECTED_IP=$selected_ip
 LAST_SWITCH_TS=$last_switch_ts

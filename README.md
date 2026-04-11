@@ -276,6 +276,47 @@ wg show
 - runtime state is stored under `/run/wg-ddns-endpoint-monitor`
 - hostname resolution uses the host resolver stack from `/etc/nsswitch.conf` and `/etc/resolv.conf`
 
+### Runtime State
+
+The monitor keeps lightweight per-peer runtime state under:
+
+- `/run/wg-ddns-endpoint-monitor/`
+
+Typical file naming looks like:
+
+- `/run/wg-ddns-endpoint-monitor/<iface>_<sanitized-peer-public-key>.state`
+
+The file name is derived from:
+
+- `<iface>_<peer-public-key>`
+- then any character outside `A-Za-z0-9._-` is replaced with `_`
+
+This state is intentionally ephemeral:
+
+- it is runtime cache, not the source of truth
+- it is safe to lose on reboot
+- the monitor can rebuild it from current `wg show` output, DNS results, and the configured endpoint
+
+Each state file currently stores these exact keys:
+
+- `CONFIG_FINGERPRINT`: the active config identity used to decide whether old state is still valid
+- `SELECTED_IP`: the currently preferred candidate IP for that peer
+- `LAST_SWITCH_TS`: when the last successful runtime endpoint switch happened
+- `NO_HANDSHAKE_SINCE`: when a peer was first observed with no successful handshake
+- `BLOCKED_ENTRIES`: short-lived cooldown entries for recently failed candidate IPs
+
+Example:
+
+```text
+CONFIG_FINGERPRINT=wg0|<peer-public-key>|vpn.example.com|51820|auto
+SELECTED_IP=203.0.113.10
+LAST_SWITCH_TS=1775884537
+NO_HANDSHAKE_SINCE=0
+BLOCKED_ENTRIES=
+```
+
+If the state file is expired, incomplete, malformed, contains unexpected keys, or no longer matches the active config, it is discarded and rebuilt automatically.
+
 ### Concurrency Semantics
 
 The monitor uses a non-blocking kernel `flock` on:
