@@ -1,4 +1,7 @@
-# /etc/wg-ddns-endpoint-monitor/config
+# wg-ddns-endpoint-monitor config
+#
+# Source repository:
+#   GitHub: https://github.com/netplus/wg-ddns-endpoint-monitor
 #
 # Monitored WireGuard interfaces:
 # - auto: scan /etc/wireguard/*.conf

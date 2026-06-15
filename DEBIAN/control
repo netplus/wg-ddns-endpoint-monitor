@@ -5,6 +5,7 @@ Priority: optional
 Architecture: all
 Depends: bash, wireguard-tools, systemd, libc-bin, util-linux
 Maintainer: netplus <netplusplus@outlook.com>
+Homepage: https://github.com/netplus/wg-ddns-endpoint-monitor
 Description: Monitor DDNS-backed WireGuard peer hostnames and refresh stale runtime endpoints
  A timer-driven oneshot monitor that inspects WireGuard peer Endpoint hostnames,
  checks handshake age, detects DNS/IP changes, and refreshes stale runtime endpoints with wg set.
